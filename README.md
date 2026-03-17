@@ -1,0 +1,1 @@
+# bist-tarama-mail-automation
