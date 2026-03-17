@@ -1,0 +1,170 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import sys
+import smtplib
+import schedule
+import time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from IPython.display import clear_output
+
+# --- AYARLAR ---
+GMAIL_ADRESIM = "korayavuuz@gmail.com"
+GMAIL_UYGULAMA_SIFRESI = "**** evnd mueb txfy" # Gmail Uygulama Şifresi (16 haneli)
+ALICI_MAIL = "korayavuuz@gmail.com"
+
+# --- Gösterge Fonksiyonları ---
+def calculate_rsi(series, period):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0))
+    loss = (-delta.where(delta < 0, 0))
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    return 100 - (100 / (1 + (avg_gain / avg_loss)))
+
+def calculate_bb(series, length=20, mult=2):
+    basis = series.rolling(window=length).mean()
+    dev = mult * series.rolling(window=length).std()
+    return basis + dev, basis - dev
+
+def mail_gonder(scan_df, live_signals):
+    msg = MIMEMultipart()
+    msg['From'] = GMAIL_ADRESIM
+    msg['To'] = ALICI_MAIL
+    msg['Subject'] = f"🚀 BIST BB/RSI Tarama Raporu - {pd.Timestamp.now().strftime('%d.%m.%Y %H:%M')}"
+
+    # HTML Tablo Tasarımı
+    html = f"""
+    <html>
+    <head>
+    <style>
+        table {{ font-family: 'Segoe UI', Arial, sans-serif; border-collapse: collapse; width: 100%; font-size: 12px; }}
+        td, th {{ border: 1px solid #dddddd; text-align: left; padding: 6px; }}
+        th {{ background-color: #333; color: white; }}
+        tr:nth-child(even) {{ background-color: #f9f9f9; }}
+        .signal-box {{ background-color: #f8f9fa; border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; }}
+    </style>
+    </head>
+    <body>
+        <div class="signal-box">
+            <h2 style="color: #2c3e50;">🔔 ANLIK İŞLEM SİNYALLERİ</h2>
+            {pd.DataFrame(live_signals, columns=['Sıra No', 'Hisse', 'Yön', 'Son Fiyat', 'RSI']).to_html(index=False) if live_signals else "<p>Şu an aktif bir sinyal bulunmuyor.</p>"}
+        </div>
+        
+        <h2 style="color: #2c3e50;">📊 BIST DUAL DIRECTION OPTIMIZATION</h2>
+        {scan_df.drop(columns=['b_len', 'r_len']).head(30).to_html(index=True)}
+        
+        <p style="color: #7f8c8d; font-size: 10px;">* Bu rapor yfinance üzerinden 15dk gecikmeli verilerle otomatik olarak oluşturulmuştur.</p>
+    </body>
+    </html>
+    """
+    msg.attach(MIMEText(html, 'html'))
+    
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_ADRESIM, GMAIL_UYGULAMA_SIFRESI)
+        server.send_message(msg)
+        server.quit()
+        print(f"\n✅ Rapor başarıyla gönderildi: {ALICI_MAIL}")
+    except Exception as e:
+        print(f"\n❌ Mail hatası: {e}")
+
+def dual_scanner_with_progress(periyot='4h', aralik='2y'):
+    sp100_hisseleri =  [
+        'AKBNK.IS', 'ARCLK.IS', 'ASELS.IS', 'ASTOR.IS', 'BIMAS.IS', 'BRSAN.IS', 'CIMSA.IS',
+        'DOAS.IS', 'DOHOL.IS', 'EGEEN.IS', 'EKGYO.IS', 'ENJSA.IS', 'ENKAI.IS', 'EREGL.IS',
+        'FROTO.IS', 'GARAN.IS', 'GESAN.IS', 'GUBRF.IS', 'HALKB.IS', 'HEKTS.IS', 'ISCTR.IS',
+        'ISMEN.IS', 'KCHOL.IS', 'KONTR.IS', 'KORDS.IS', 'KRDMD.IS', 'MAVI.IS', 'MGROS.IS', 
+        'ODAS.IS', 'OTKAR.IS', 'OYAKC.IS', 'PETKM.IS', 'PGSUS.IS', 'SAHOL.IS', 'SASA.IS', 
+        'SISE.IS', 'SMRTG.IS', 'SOKM.IS', 'TAVHL.IS', 'TCELL.IS', 'THYAO.IS', 'TUPRS.IS', 'YKBNK.IS'
+    ]
+    all_scan_results = []
+    potential_signals = [] # Geçici sinyal listesi
+    total_hisse = len(sp100_hisseleri)
+    
+    print(f"🔍 Tarama Başladı: {pd.Timestamp.now()}")
+    
+    for idx, hisse in enumerate(sp100_hisseleri):
+        percent = (idx + 1) / total_hisse * 100
+        progress_bar = "█" * int(percent / 2) + "-" * (50 - int(percent / 2))
+        sys.stdout.write(f"\r🔍 Tarama Yapılıyor: |{progress_bar}| %{percent:.1f} ({hisse})")
+        sys.stdout.flush()
+
+        try:
+            df = yf.download(hisse, period=aralik, interval=periyot, progress=False, auto_adjust=True)
+            if df.empty or len(df) < 100: continue
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            
+            close_prices = df['Close'].squeeze()
+            best_pf = -1
+            best_hisse_data = {}
+
+            for b_len in [20, 30]:
+                u_b, l_b = calculate_bb(close_prices, length=b_len)
+                for r_len in [7, 10, 14]:
+                    rsi_serisi = calculate_rsi(close_prices, r_len)
+                    for s_val in [1.5, 2.5, 3.5, 2.0, 3.0, 4.0]:
+                        sermaye, pos, entry_price, trades = 100.0, 0, 0, []
+
+                        for i in range(1, len(df)):
+                            price, rsi = close_prices.iloc[i], rsi_serisi.iloc[i]
+                            up, low = u_b.iloc[i], l_b.iloc[i]
+                            if np.isnan(rsi) or np.isnan(low): continue
+
+                            if pos == 0:
+                                if price <= low and rsi < 35: pos, entry_price = 1, price
+                                elif price >= up and rsi > 70: pos, entry_price = -1, price
+                            elif pos == 1:
+                                pnl = (price - entry_price) / entry_price * 100
+                                if price >= up or rsi > 70 or pnl <= -s_val: sermaye *= (1 + pnl/100); trades.append(pnl); pos = 0
+                            elif pos == -1:
+                                pnl = (entry_price - price) / entry_price * 100
+                                if price <= low or rsi < 30 or pnl <= -s_val: sermaye *= (1 + pnl/100); trades.append(pnl); pos = 0
+
+                        if len(trades) >= 5: # İŞLEM SAYISI > 5 FİLTRESİ
+                            gains = [x for x in trades if x > 0]
+                            losses = [abs(x) for x in trades if x < 0]
+                            wr = (len(gains) / len(trades) * 100)
+                            
+                            if wr >= 40: # WR > 40 FİLTRESİ
+                                pf = sum(gains) / sum(losses) if sum(losses) > 0 else sum(gains)
+                                if pf > best_pf:
+                                    best_pf = pf
+                                    best_hisse_data = {'Hisse': hisse, 'BB_RSI': f"{b_len}/{r_len}", 'Stop_%': s_val, 'Net_Kar_%': round(sermaye - 100, 2), 'Avg_Trade_%': round(np.mean(trades), 2), 'PF': round(pf, 2), 'WR_%': round(wr, 1), 'İşlem': len(trades), 'b_len': b_len, 'r_len': r_len}
+
+            if best_hisse_data:
+                all_scan_results.append(best_hisse_data)
+                last_p, last_r = close_prices.iloc[-1], calculate_rsi(close_prices, best_hisse_data['r_len']).iloc[-1]
+                l_up, l_low = calculate_bb(close_prices, length=best_hisse_data['b_len'])
+                if last_p <= l_low.iloc[-1] and last_r < 35: potential_signals.append({'Hisse': hisse, 'Yön': "LONG", 'Fiyat': round(last_p, 2), 'RSI': round(last_r, 1)})
+                elif last_p >= l_up.iloc[-1] and last_r > 70: potential_signals.append({'Hisse': hisse, 'Yön': "SHORT", 'Fiyat': round(last_p, 2), 'RSI': round(last_r, 1)})
+        except: continue
+
+    # Verileri sırala ve index (Sıra No) ata
+    scan_df = pd.DataFrame(all_scan_results).sort_values(by='PF', ascending=False)
+    scan_df.index = range(1, len(scan_df) + 1)
+    
+    # Canlı sinyallerin başarı sırasını bul
+    live_signals = []
+    for sig in potential_signals:
+        try:
+            sira_no = scan_df[scan_df['Hisse'] == sig['Hisse']].index[0]
+            live_signals.append([sira_no, sig['Hisse'], sig['Yön'], sig['Fiyat'], sig['RSI']])
+        except: continue # Filtreye takılan hisse sinyal verse bile listeye girmez
+
+    clear_output()
+    print(f"\n✅ Tarama Tamamlandı ({pd.Timestamp.now()}). Mail gönderiliyor...")
+    mail_gonder(scan_df, live_signals)
+
+# --- ZAMANLAYICI ---
+schedule.every().day.at("13:16").do(dual_scanner_with_progress)
+schedule.every().day.at("17:16").do(dual_scanner_with_progress)
+schedule.every().day.at("18:26").do(dual_scanner_with_progress)
+
+print(f"🚀 BIST BB/RSI Botu Aktif! \n📍 İlk Mail: 13:16 📍 İkinci Mail: 17:16 📍 Üçüncü Mail: 18:26")
+
+while True:
+    schedule.run_pending()
+    time.sleep(60)
