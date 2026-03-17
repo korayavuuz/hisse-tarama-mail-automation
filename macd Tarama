@@ -1,0 +1,172 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import schedule
+import time
+import sys
+from datetime import datetime
+
+# --- KULLANICI AYARLARI ---
+GMAIL_ADRES = "korayavuuz@gmail.com"
+GMAIL_SIFRE = "**** evnd mueb txfy"
+ALICI_MAIL = "korayavuuz@gmail.com"
+
+hisseler = [
+    'AKBNK.IS', 'ARCLK.IS', 'ASELS.IS', 'ASTOR.IS', 'BIMAS.IS', 'BRSAN.IS', 'CIMSA.IS', 'DOAS.IS', 'DOHOL.IS', 'EGEEN.IS', 'EKGYO.IS', 'ENJSA.IS', 'ENKAI.IS', 'EREGL.IS', 'FROTO.IS', 'GARAN.IS', 'GESAN.IS', 'GUBRF.IS', 'HALKB.IS', 'HEKTS.IS', 'ISCTR.IS', 'ISMEN.IS', 'KCHOL.IS', 'KONTR.IS', 'KORDS.IS', 'KRDMD.IS', 'MAVI.IS', 'MGROS.IS', 'ODAS.IS', 'OTKAR.IS', 'OYAKC.IS', 'PETKM.IS', 'PGSUS.IS', 'SAHOL.IS', 'SASA.IS', 'SISE.IS', 'SMRTG.IS', 'SOKM.IS', 'TAVHL.IS', 'TCELL.IS', 'THYAO.IS', 'TUPRS.IS', 'YKBNK.IS'
+]
+
+def calculate_indicators(df):
+    fast_ema = df['Close'].ewm(span=12, adjust=False).mean()
+    slow_ema = df['Close'].ewm(span=26, adjust=False).mean()
+    macd_line = fast_ema - slow_ema
+    
+    high_low = df['High'] - df['Low']
+    high_cp = abs(df['High'] - df['Close'].shift())
+    low_cp = abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    atr_v = tr.rolling(window=26).mean()
+    
+    macdv = (macd_line / atr_v) * 100
+    signal_line = macdv.ewm(span=9, adjust=False).mean()
+    
+    df['Vol_Avg'] = df['Volume'].rolling(window=20).mean()
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    return macdv, signal_line
+
+def tarama_ve_mail():
+    print(f"\n🔔 BIST MACD-V Performans Taraması Başladı: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    live_signals = []
+    performance_results = []
+
+    for hisse in hisseler:
+        try:
+            df = yf.download(hisse, period='2y', interval='4h', progress=False, auto_adjust=True)
+            if len(df) < 60: continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            macdv, signal_line = calculate_indicators(df)
+            
+            # --- BACKTEST MANTIĞI ---
+            sermaye, pos, entry, trades = 100.0, 0, 0, []
+            for i in range(1, len(df)):
+                m, s = macdv.iloc[i], signal_line.iloc[i]
+                m_prev, s_prev = macdv.iloc[i-1], signal_line.iloc[i-1]
+                price = df['Close'].iloc[i]
+
+                if pos == 0:
+                    if m > s and m_prev <= s_prev and price > df['EMA50'].iloc[i] and df['Volume'].iloc[i] > (df['Vol_Avg'].iloc[i] * 1.5):
+                        pos, entry = 1, price
+                elif pos == 1:
+                    if m < s and m_prev >= s_prev:
+                        pnl = (price - entry) / entry * 100
+                        sermaye *= (1 + pnl/100)
+                        trades.append(pnl)
+                        pos = 0
+
+            if trades:
+                gains = [x for x in trades if x > 0]
+                losses = [abs(x) for x in trades if x < 0]
+                pf = sum(gains) / sum(losses) if sum(losses) > 0 else sum(gains)
+                win_rate = (len(gains) / len(trades)) * 100
+                avg_trade = sum(trades) / len(trades)
+                
+                # --- FİLTRELEME: İŞLEM > 5 VE WIN RATE > 40 ---
+                if len(trades) > 12 and win_rate > 40:
+                    performance_results.append({
+                        'Hisse': hisse.replace('.IS',''),
+                        'Net_Kar_%': round(sermaye - 100, 2),
+                        'Avg_Trade_%': round(avg_trade, 2),
+                        'Win_Rate_%': round(win_rate, 1),
+                        'PF': round(pf, 2),
+                        'İşlem': len(trades)
+                    })
+
+                    # --- CANLI SİNYAL KONTROLÜ (Sadece kriterlere uyanlar için) ---
+                    for b in range(1, 6):
+                        if macdv.iloc[-b] > signal_line.iloc[-b] and macdv.iloc[-b-1] <= signal_line.iloc[-b-1]:
+                            if df['Close'].iloc[-b] > df['EMA50'].iloc[-b] and df['Volume'].iloc[-b] > (df['Vol_Avg'].iloc[-b] * 1.5):
+                                live_signals.append({
+                                    'Hisse': hisse.replace('.IS',''),
+                                    'Fiyat': round(float(df['Close'].iloc[-b]), 2),
+                                    'Zaman': f"{b-1} mum önce"
+                                })
+                            break
+        except Exception as e:
+            print(f"Hata {hisse}: {e}")
+
+    # --- SIRALAMA VE INDEKSEME ---
+    df_perf = pd.DataFrame(performance_results).sort_values(by='PF', ascending=False).reset_index(drop=True)
+    df_perf.index = df_perf.index + 1 # 1'den başlayan index
+    
+    # Canlı sinyallere sıra numarası ekleme
+    live_list = []
+    for sig in live_signals:
+        hisse_adi = sig['Hisse']
+        # Performans tablosundaki yerini bul
+        row = df_perf[df_perf['Hisse'] == hisse_adi]
+        if not row.empty:
+            sig['Performans_Sırası'] = row.index[0]
+            live_list.append(sig)
+    
+    df_live = pd.DataFrame(live_list)
+    if not df_live.empty:
+        df_live = df_live[['Performans_Sırası', 'Hisse', 'Fiyat', 'Zaman']] # Sütun sırası
+
+    zaman = datetime.now().strftime('%d.%m.%Y %H:%M')
+    html = f"""
+    <html>
+    <head>
+    <style>
+        table {{ font-family: Arial, sans-serif; border-collapse: collapse; width: 100%; font-size: 13px; }}
+        td, th {{ border: 1px solid #ddd; text-align: left; padding: 8px; }}
+        th {{ background-color: #2c3e50; color: white; }}
+        tr:nth-child(even) {{ background-color: #f2f2f2; }}
+        .header {{ color: #2c3e50; border-bottom: 2px solid #2c3e50; padding-bottom: 5px; }}
+        .signal-box {{ border-left: 5px solid #27ae60; background: #fafffa; padding: 10px; margin-bottom: 20px; }}
+    </style>
+    </head>
+    <body>
+        <div class="signal-box">
+            <h2 class="header">🔔 ANLIK ALIM SİNYALLERİ (Kriterlere Uyanlar)</h2>
+            {df_live.to_html(index=False) if not df_live.empty else "<p>Kriterlere uyan yeni sinyal yok.</p>"}
+        </div>
+        <h2 class="header">📈 STRATEJİ BACKTEST PERFORMANSI (İşlem > 12 & WR > %40)</h2>
+        <p>PF Değerine göre sıralanmış, stratejiye en uyumlu hisseler:</p>
+        {df_perf.to_html(index=True)}
+        <p style="color: grey; font-size: 10px;">* Rapor 4h verilerle otomatik oluşturuldu. {zaman}</p>
+    </body>
+    </html>
+    """
+    konu = f"🎯 BIST MACD-V Performans Raporu - {zaman}"
+    mail_gonder_html(konu, html)
+
+def mail_gonder_html(konu, html_icerik):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = GMAIL_ADRES
+        msg['To'] = ALICI_MAIL
+        msg['Subject'] = konu
+        msg.attach(MIMEText(html_icerik, 'html'))
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_ADRES, GMAIL_SIFRE)
+        server.send_message(msg)
+        server.quit()
+        print(f"📧 Rapor gönderildi: {konu}")
+    except Exception as e:
+        print(f"Mail hatası: {e}")
+
+# --- ZAMANLAYICI ---
+schedule.every().day.at("13:16").do(tarama_ve_mail)
+schedule.every().day.at("17:16").do(tarama_ve_mail)
+schedule.every().day.at("18:16").do(tarama_ve_mail)
+
+print(f"🚀 MACD-V BIST Tarama Bot çalışıyor. Hedef Saatler: 13:16, 17:16, 18:26")
+
+while True:
+    schedule.run_pending()
+    time.sleep(60)
